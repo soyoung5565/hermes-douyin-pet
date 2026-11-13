@@ -1,0 +1,36 @@
+name: hermes-douyin-pet
+label: 桌宠刷抖音
+kind: standalone
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: >-
+  Let the Hermes desktop pet watch Douyin on its own. Drives a dedicated Microsoft
+  Edge instance (Playwright, persistent profile so the login survives restarts),
+  samples real frames from the recommended feed, lets the host model judge whether
+  the clip is worth keeping watching, then skips or continues and reports a
+  one-line reaction. Implementation follows the upstream dsh-douyin-agent design
+  (Node browser worker + host-side orchestration); the QQ/private-message,
+  comment and share features of that project are deliberately not ported.
+author: Hermes Agent
+license: MIT
+tags: [douyin, desktop-pet, browser, playwright, video]
+platforms: [windows, linux, macos]
+requires_hermes: ">=0.21.5"
+provides_tools:
+  - douyin_open
+  - douyin_status
+  - douyin_observe
+  - douyin_next
+  - douyin_play
+  - douyin_pause
+  - douyin_watch
+  - douyin_close
+provides_hooks:
+  - on_session_end
+# 可选:配置了才做音轨转写(对白理解)。不配也能刷视频 —— 只是听不见对白。
+optional_env:
+  - name: MINIMAX_CN_API_KEY
+    description: "MiniMax API key — optional. Only used to transcribe the audio track (speech-to-text). Without it the pet watches silently."
+    url: "https://platform.minimaxi.com/user-center/basic-information/interface-key"
+    secret: true
