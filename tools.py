@@ -296,16 +296,21 @@ def _transcribe(ctx, worker, work_dir: str) -> str:
     """录一段音轨并转写。失败就返回空串(不影响主流程)。"""
     try:
         raw = worker.request("audio", workDir=work_dir, timeout=90.0)
-    except DouyinWorkerError:
+    except DouyinWorkerError as exc:
+        _asr_log(f"录音请求失败: {exc}")
         return ""
     if not raw or not Path(str(raw)).is_file():
+        _asr_log(f"录音文件不存在: {raw!r}")
         return ""
     # 录音是 webm/opus,MiniMax ASR 只收 wav —— 用 ffmpeg 转。
     wav = _to_wav(str(raw))
     if not wav:
+        _asr_log("ffmpeg 转 wav 失败(找不到 ffmpeg 或转换出错)")
         return ""
     try:
-        return _asr(ctx, wav)
+        text = _asr(ctx, wav)
+        _asr_log(f"转写完成: {len(text)} 字 -> {text[:80]!r}")
+        return text
     finally:
         try:
             os.unlink(wav)
@@ -348,20 +353,65 @@ def _to_wav(src: str) -> Optional[str]:
     return dst if Path(dst).is_file() else None
 
 
+def _asr_env(name: str) -> str:
+    """读一个凭据/端点变量。
+
+    ★ 坑(2026-11-14 实测):Hermes 的 `.env` **不会自动注入 os.environ** ——
+      插件进程里 `MINIMAX_CN_API_KEY` 恒为空,`_asr()` 第一步就 return "" ,
+      转写静默失效(音轨一直是静音,而且日志里一行都没有)。
+      三级取法(从可靠到兜底):
+        ① `hermes_cli.config.get_env_value_prefer_dotenv` —— 专门为「读 Hermes 管理的 .env」准备,
+           会读 $HERMES_HOME/.env,scope 安全(多 profile 时不串号)。
+        ② `agent.secret_scope.get_secret_str` —— 进程已注入的凭据作用域。
+        ③ `os.environ` —— 单 profile 部署直接用进程环境注入时有效。
+    """
+    try:
+        from hermes_cli.config import get_env_value_prefer_dotenv
+        value = (get_env_value_prefer_dotenv(name) or "").strip()
+        if value:
+            return value
+    except Exception as exc:
+        _asr_log(f"get_env_value_prefer_dotenv 不可用({name}): {type(exc).__name__}: {exc}")
+    try:
+        from agent.secret_scope import get_secret_str
+        value = (get_secret_str(name, "") or "").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return (os.environ.get(name) or "").strip()
+
+
 def _asr_key() -> str:
     """MiniMax ASR 的 key —— 可选能力,没配就跳过转写(不影响刷视频主线)。"""
     for name in ("MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"):
-        value = (os.environ.get(name) or "").strip()
+        value = _asr_env(name)
         if value:
             return value
+    _asr_log("没有 MINIMAX key —— 跳过转写")
     return ""
 
 
 def _asr_base() -> str:
+    """MiniMax ASR 的服务根地址。
+
+    ★ 坑(2026-11-14 实测):`MINIMAX_CN_BASE_URL` 在 .env 里是
+    `https://api.minimax.cn/anthropic` —— 那是 **Anthropic 兼容端点**,
+    语音转写不在那条路径下。直接拼 `{base}/v1/speech_to_text` 会得到
+    `https://api.minimax.cn/anthropic/v1/speech_to_text` → **HTTP 404**。
+    实测正确端点是 `https://api.minimax.cn/v1/speech_to_text`(HTTP 200)。
+    → 这里把 base 归一化到「站点根」,去掉 /anthropic 这类兼容层前缀。
+    """
     for name in ("MINIMAX_CN_BASE_URL", "MINIMAX_BASE_URL"):
-        value = (os.environ.get(name) or "").strip()
+        value = _asr_env(name)
         if value:
-            return value.rstrip("/")
+            base = value.rstrip("/")
+            # 去掉 Anthropic/OpenAI 兼容层前缀(只剩站点根)
+            for suffix in ("/anthropic", "/v1", "/openai"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+            return base
     return "https://api.minimax.cn"
 
 
@@ -389,7 +439,10 @@ def _asr(ctx, wav_path: str) -> str:
             parts.append(
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key_name}\"\r\n\r\n{value}\r\n".encode()
             )
-        ctype = mimetypes.guess_type(path.name)[0] or "audio/wav"
+        # ★ mime 必须和真实容器一致(2026-11-14 实测):
+        #   之前用 `mimetypes.guess_type('audio.raw')` → 猜出 `image/RAW`,
+        #   MiniMax 直接 400 拒收。这里按后缀显式映射,不猜。
+        ctype = _audio_mime(path.name)
         parts.append(
             (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
              f"filename=\"{path.name}\"\r\nContent-Type: {ctype}\r\n\r\n").encode()
@@ -407,11 +460,66 @@ def _asr(ctx, wav_path: str) -> str:
         )
         with urllib.request.urlopen(request, timeout=120) as resp:
             payload = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception:
+    except Exception as exc:
+        # ★ 别再把错误整个吞掉 —— 之前 except Exception: return "" 让
+        #   「ASR 从来没成功过」这件事完全隐形(日志里一行都没有)。
+        #   转写失败要能看见:写日志 + 返回空串继续主流程。
+        _asr_log(f"ASR 失败: {type(exc).__name__}: {exc}")
         return ""
     if isinstance(payload, dict):
         return str(payload.get("text") or "").strip()
     return ""
+
+
+# MiniMax ASR 只认这些容器(2026-11-14 实测 400 消息原文):
+#   supported: wav, aiff, flac, alac, mp3, aac, opus, ogg
+_AUDIO_MIME_MAP = {
+    ".wav": "audio/wav",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".alac": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".aac": "audio/aac",
+    ".opus": "audio/opus",
+    ".ogg": "audio/ogg",
+    ".webm": "audio/webm",
+}
+
+
+def _audio_mime(name: str) -> str:
+    """按后缀显式映射音频 mime。
+
+    为什么不靠 mimetypes:`mimetypes.guess_type('audio.raw')` 会猜成
+    `image/RAW`,`guess_type('audio.webm')` 会猜成 `video/webm` —— 都不是
+    MiniMax 认的类型。实测 webm 直传 → 400 unsupported audio format。
+    """
+    return _AUDIO_MIME_MAP.get(Path(name).suffix.lower(), "application/octet-stream")
+
+
+def _asr_log(message: str) -> None:
+    """ASR 侧的诊断日志。
+
+    ★ 双写(2026-11-14 实测):只写 logger 的话,插件在 `hermes -z` 子进程里
+      跑时,WARNING 常常既不进 agent.log 也不进 gateway-stdio.log —— 排查时
+      表现为「加了日志但什么都没打」,白查一轮。
+      所以额外落一个独立文件 `<HERMES_HOME>/logs/douyin-pet.log`,永远能查到。
+    """
+    import logging
+    try:
+        logging.getLogger(__name__).warning(message)
+    except Exception:
+        pass
+    try:
+        from pathlib import Path as _P
+        home = os.environ.get("HERMES_HOME") or str(_P.home() / ".hermes")
+        log_dir = _P(home) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "douyin-pet.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} {message}\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- 工具处理

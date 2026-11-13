@@ -359,19 +359,82 @@ async function observe() {
   return { frames, workDir };
 }
 
-/** 录 5 秒音轨(webm/opus),存成文件路径返回。 */
+/**
+ * 录 5 秒音轨(webm/opus),存成文件路径返回。
+ *
+ * ★★ 三个真 bug(2026-11-14 实测定位,之前音轨转写**从来没成功过**):
+ *
+ *   ① `document.querySelector('video')` 会选中**预加载的幽灵视频**。
+ *      实测页面上 `videoCount=1` 但那个 video 是
+ *      `paused=true, muted=true, volume=0, readyState=0, src="", w=0, h=0`
+ *      —— 根本没在播。→ 录出来必然是静音。
+ *      修法:优先取 `[data-e2e="feed-active-video"]` 里的 video,
+ *      并要求 `readyState>=2 && !paused && videoWidth>0` 才算数。
+ *
+ *   ② 视频被静音时 `createMediaElementSource` 拿到的还是静音流。
+ *      修法:录音前把 `v.muted=false; v.volume=1` 设回去(记录原值,录完还原)。
+ *
+ *   ③ `createMediaElementSource` 对同一个 video 只能调一次,
+ *      第二次抛 `InvalidStateError: already connected previously to a
+ *      different MediaElementSourceNode` —— 第二条视频开始就崩,整轮失败。
+ *      实测我这是在探针里撞到的(同一页面连录两次)。
+ *      修法:每个 video 元素只连一次,用 WeakMap 缓存 MediaElementAudioSourceNode;
+ *      换片后 video 元素会变(new element)→ 自然拿到新节点。
+ *
+ * 另外 AudioContext 必须在 `resume()` 之后录,否则部分环境是 suspended。
+ */
 async function captureAudio(workDir) {
   if (!page) return null;
   const b64 = await page.evaluate(`(async () => {
-    const v = document.querySelector('video');
-    if (!v || v.readyState < 2) return '';
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return '';
-    const ctx = new Ctx();
-    const src = ctx.createMediaElementSource(v);
+
+    // ① 找「真正在播的那个 video」
+    const pickVideo = () => {
+      const active = document.querySelector('[data-e2e="feed-active-video"]');
+      const candidates = [];
+      if (active && active.tagName === 'VIDEO') candidates.push(active);
+      if (active) {
+        const inner = active.querySelector('video');
+        if (inner) candidates.push(inner);
+      }
+      candidates.push(...Array.from(document.querySelectorAll('video')));
+      for (const v of candidates) {
+        if (!v) continue;
+        if (v.readyState >= 2 && v.videoWidth > 0 && !v.paused) return v;
+      }
+      // 兜底:至少有尺寸和源(可能暂停,但至少不是幽灵元素)
+      for (const v of candidates) {
+        if (v && v.videoWidth > 0 && v.readyState >= 2) return v;
+      }
+      return candidates[0] || null;
+    };
+
+    const v = pickVideo();
+    if (!v) return '';
+    if (v.readyState < 2) return '';   // 还没可解码 → 录了也是空的
+
+    // ② 解除静音(录完还原)
+    const prevMuted = v.muted;
+    const prevVolume = v.volume;
+    try { v.muted = false; v.volume = 1; } catch { /* ignore */ }
+
+    // ③ 每个 video 元素只连一次 createMediaElementSource
+    const key = '__hermesAudioNode__';
+    if (!v[key]) {
+      const ctx0 = new Ctx();
+      try { await ctx0.resume(); } catch { /* ignore */ }
+      const node = ctx0.createMediaElementSource(v);
+      node.connect(ctx0.destination);
+      v[key] = { ctx: ctx0, node };
+    }
+    const holder = v[key];
+
+    const ctx = holder.ctx;
+    try { await ctx.resume(); } catch { /* ignore */ }
     const dest = ctx.createMediaStreamDestination();
-    src.connect(dest);
-    src.connect(ctx.destination);
+    holder.node.connect(dest);
+
     const recorder = new MediaRecorder(dest.stream);
     const chunks = [];
     recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
@@ -379,7 +442,9 @@ async function captureAudio(workDir) {
     await new Promise(r => setTimeout(r, 5000));
     recorder.stop();
     const blob = await new Promise(r => recorder.onstop = () => r(new Blob(chunks, { type: 'audio/webm' })));
-    ctx.close();
+    try { holder.node.disconnect(dest); } catch { /* ignore */ }
+    try { v.muted = prevMuted; v.volume = prevVolume; } catch { /* ignore */ }
+
     const buf = await blob.arrayBuffer();
     const bytes = new Uint8Array(buf);
     let bin = '';
